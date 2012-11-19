@@ -1,0 +1,11 @@
+Revision history for DVB-Epg
+
+0.33    20120912 10:47 CET
+        o First public release of software
+
+0.34    20120914 01:06 CET
+        - Correction of eventDelete API
+        - Randomization of sections in generation of output TS
+
+0.44   2012-11-08 08:16 CET
+        - Minor correction in scheduler
