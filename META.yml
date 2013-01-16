@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               DVB-Epg
-version:            0.44
+version:            0.46
 abstract:           Generate packetized elementary stream containing DVB Event Information table.
 author:
     - Bojan Ramšak <BojanR@gmx.net>

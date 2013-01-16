@@ -53,11 +53,12 @@ use DBI qw(:sql_types);
 use Storable qw(freeze thaw);
 use Carp;
 use Exporter;
+use utf8;
 use vars qw($VERSION @ISA @EXPORT);
 
 use constant DEBUG => 0;
 
-our $VERSION = "0.44";
+our $VERSION = "0.46";
 our @ISA     = qw(Exporter);
 our @EXPORT  = qw();
 
@@ -74,9 +75,9 @@ sub new {
     my $self  = {};
 
     $self->{filename} = shift;
-    $self->{dbh}      = DBI->connect( "dbi:SQLite:" . $self->{filename} )
-      or return;
-
+    $self->{dbh}      = DBI->connect( "dbi:SQLite:" . $self->{filename} ) or return;
+    
+    $self->{dbh}->{sqlite_unicode} = 1;
     $self->{dbh}->do( "PRAGMA synchronous = OFF; PRAGMA temp_store = MEMORY; PRAGMA auto_vacuum = NONE; PRAGMA cache_size = 4000000; " );
 
     bless( $self, $class );
@@ -129,18 +130,18 @@ sub initdb {
                             PRIMARY KEY( pid, original_network_id, transport_stream_id, service_id))");
 
     $dbh->do( "CREATE TABLE eit_version ( pid INTEGER,
-                                          uid INTEGER,
+                                          service_id INTEGER,
                                           table_id INTEGER,
                                           version_number INTEGER,
                                           timestamp DATE,
-                                          PRIMARY KEY( pid, uid, table_id))");
+                                          PRIMARY KEY( pid, service_id, table_id))");
 
     $dbh->do( "CREATE TABLE section ( pid INTEGER,
                                       table_id INTEGER,
-                                      uid INTEGER,
+                                      service_id INTEGER,
                                       section_number INTEGER,
                                       dump BLOB, 
-                                      PRIMARY KEY( pid, uid, table_id, section_number))");
+                                      PRIMARY KEY( pid, service_id, table_id, section_number))");
 
     # define triggers that set timestamps on each event when updated
     $dbh->do( "CREATE TRIGGER event_timestamp_insert 
@@ -166,10 +167,10 @@ sub initdb {
                BEGIN
                   DELETE FROM eit_version 
                   WHERE eit_version.pid = old.pid
-                  AND eit_version.uid = old.uid;
+                  AND eit_version.service_id = old.service_id;
                   DELETE FROM section 
                   WHERE section.pid = old.pid
-                  AND section.uid = old.uid;
+                  AND section.service_id = old.service_id;
                END;");
 
     return $dbh->do("COMMIT");
@@ -469,7 +470,7 @@ sub updateEit {
     while ( $rule = $sel->fetchrow_hashref ) {
 
         # first calculate present/following
-        print "update present/following for uid: $rule->{uid} in pid: $rule->{pid}\n" if DEBUG;
+        print "update present/following for uid: $rule->{service_id} in pid: $rule->{pid}\n" if DEBUG;
         $ret = $self->updateEitPresent($rule);
         if( ! defined $ret) {
             print "Error updating present/following tables" if DEBUG;
@@ -479,7 +480,7 @@ sub updateEit {
 
         # and then calculate schedule
         if ( $rule->{maxsegments} > 0 ) {
-            print "update schedule for uid: $rule->{uid} in pid: $rule->{pid} [" . int( $rule->{maxsegments} / 8 ) . "]\n" if DEBUG;
+            print "update schedule for uid: $rule->{service_id} in pid: $rule->{pid} [" . int( $rule->{maxsegments} / 8 ) . "]\n" if DEBUG;
             $ret = $self->updateEitSchedule($rule);
             if( ! defined $ret) {
                 print "Error updating schedule tables" if DEBUG;
@@ -495,7 +496,7 @@ sub updateEit {
 
 Update eit sections for given $rule.
 $rule is reference to hash containing keys:
-pid, service_id, original_network_id, transport_stream_id, uid, maxsegments, actual
+pid, service_id, original_network_id, transport_stream_id, service_id, maxsegments, actual
 
 Update sections only if there are changes in event table of schedule since last update or 
 the $forced flag is set to 1.
@@ -519,7 +520,7 @@ sub updateEitPresent {
 
     # lookup version_number used at last generation of eit and timestamp
     my $select = $dbh->prepare( "SELECT version_number, strftime('%s',timestamp) FROM eit_version "
-            ." WHERE pid=$rule->{pid} AND table_id=$rule->{table_id} AND uid=$rule->{uid}" );
+            ." WHERE pid=$rule->{pid} AND table_id=$rule->{table_id} AND service_id=$rule->{service_id}" );
 
     $select->execute();
     my ( $last_version_number, $last_update_timestamp ) = $select->fetchrow_array();
@@ -641,9 +642,9 @@ sub updateEitPresent {
 
     # Remove all section of this table
     return 
-      if !$dbh->do( "DELETE FROM section WHERE pid=$rule->{pid} AND uid=$rule->{uid} AND table_id=$rule->{table_id}" );
+      if !$dbh->do( "DELETE FROM section WHERE pid=$rule->{pid} AND service_id=$rule->{service_id} AND table_id=$rule->{table_id}" );
 
-    my $insert = $dbh->prepare( "INSERT INTO section VALUES ( $rule->{pid}, $rule->{table_id}, $rule->{uid}, ?, ?)");
+    my $insert = $dbh->prepare( "INSERT INTO section VALUES ( $rule->{pid}, $rule->{table_id}, $rule->{service_id}, ?, ?)");
     return if !$insert;
 
     my $sections = $present_following->getSections($last_version_number);
@@ -653,7 +654,7 @@ sub updateEitPresent {
         $insert->bind_param( 2, $sections->{$section_number}, SQL_BLOB );
         $insert->execute();
     }
-    return $dbh->do( "INSERT OR REPLACE INTO eit_version VALUES ($rule->{pid}, $rule->{uid}, "
+    return $dbh->do( "INSERT OR REPLACE INTO eit_version VALUES ($rule->{pid}, $rule->{service_id}, "
             . "$rule->{table_id}, $last_version_number, datetime( $current_time,'unixepoch'))"
     );
 }
@@ -662,7 +663,7 @@ sub updateEitPresent {
 
 Update eit playout packet for given $rule.
 $rule is reference to hash containing keys:
-pid, service_id, original_network_id, transport_stream_id, uid, maxsegments, actual
+pid, service_id, original_network_id, transport_stream_id, service_id, maxsegments, actual
 
 =cut
 
@@ -694,7 +695,7 @@ sub updateEitSchedule {
         # lookup version_number used at last generation of eit and timestamp
         my $select = $dbh->prepare(
             "SELECT version_number, strftime('%s',timestamp) FROM eit_version 
-                WHERE pid=$rule->{pid} AND table_id=$rule->{table_id} AND uid=$rule->{uid}"
+                WHERE pid=$rule->{pid} AND table_id=$rule->{table_id} AND service_id=$rule->{service_id}"
         );
         $select->execute();
         my ( $last_version_number, $last_update_timestamp ) =
@@ -810,10 +811,10 @@ sub updateEitSchedule {
         # Remove all section of this table
         return if !$dbh->do( "DELETE FROM section "
                 . "WHERE pid=$rule->{pid} "
-                . "AND uid=$rule->{uid} "
+                . "AND service_id=$rule->{service_id} "
                 . "AND table_id=$rule->{table_id}" );
 
-        my $insert = $dbh->prepare( "INSERT INTO section VALUES ( $rule->{pid}, $rule->{table_id}, $rule->{uid}, ?, ?)" );
+        my $insert = $dbh->prepare( "INSERT INTO section VALUES ( $rule->{pid}, $rule->{table_id}, $rule->{service_id}, ?, ?)" );
         return  if !$insert;
 
         my $sections = $schedule->getSections($last_version_number);
@@ -824,7 +825,7 @@ sub updateEitSchedule {
             $insert->execute();
         }
 
-        return if !$dbh->do( "INSERT OR REPLACE INTO eit_version VALUES ( $rule->{pid}, $rule->{uid}, $rule->{table_id}, $last_version_number, datetime( $current_time,'unixepoch'))");
+        return if !$dbh->do( "INSERT OR REPLACE INTO eit_version VALUES ( $rule->{pid}, $rule->{service_id}, $rule->{table_id}, $last_version_number, datetime( $current_time,'unixepoch'))");
     }
     continue {
         ++$subtable_count;
@@ -855,11 +856,11 @@ sub getEit {
     }
 
     # fetch all sections from database
-    my $sel = $dbh->prepare( "SELECT table_id, uid, section_number, dump FROM section WHERE pid=$pid ORDER BY RANDOM()" );
+    my $sel = $dbh->prepare( "SELECT table_id, service_id, section_number, dump FROM section WHERE pid=$pid ORDER BY table_id" );
     $sel->execute();
 
-    my ( $_table_id, $_uid, $_section_number, $_dump );
-    $sel->bind_columns( \( $_table_id, $_uid, $_section_number, $_dump ) );
+    my ( $_table_id, $_service_id, $_section_number, $_dump );
+    $sel->bind_columns( \( $_table_id, $_service_id, $_section_number, $_dump ) );
 
     my @allSections;
     my $allSectionCount = 0;
