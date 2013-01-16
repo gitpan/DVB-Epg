@@ -2,14 +2,14 @@ package DVB::Epg;
 
 =head1 NAME
 
-DVB::Epg - Generate packetized elementary stream containing DVB Event Information table.
+DVB::Epg - Generate MPEG-2 transport stream chunk containing DVB Event Information table.
 
 =head1 SYNOPSIS
 
 This module allows generating of DVB EPG service by building EIT p/f and schedule tables.
 First some event information must be added to the system. A sqlite database for storage is used.
 Based on this event information the library builds the standardized EIT, which can then be
-export as a MPEG-2 transport stream for playout. The result of the whole process is an EIT 
+export as a MPEG-2 Transport Stream/chunk for playout. The result of the whole process is an EIT 
 inside a MTS.
 
     use DVB::Epg;
@@ -20,13 +20,13 @@ inside a MTS.
     $myEpg->initdb();
 
     # add program to EIT for which to generate EPG
-    $myEpg->addEit( 18, 9019, 1024, 1, 8, 1);
+    $myEpg->addEit( 18, 9019, 1024, 15, 8, 1);
     
     # add dummy event data to database
     my $event = {};
     $event->{start} = time;
     $event->{stop}  = time+100;
-    $event->{uid} = 9019;
+    $event->{uid} = 15;
     $myEpg->addEvent( $event);
     
     # generate EPG tables to database
@@ -56,9 +56,7 @@ use Exporter;
 use utf8;
 use vars qw($VERSION @ISA @EXPORT);
 
-use constant DEBUG => 0;
-
-our $VERSION = "0.46";
+our $VERSION = "0.47";
 our @ISA     = qw(Exporter);
 our @EXPORT  = qw();
 
@@ -201,7 +199,6 @@ sub addEvent {
       or !exists $event->{stop}
       or !exists $event->{start}
       or $event->{stop} <= $event->{start}) {
-      print "Not enough parameters for adding Event" if DEBUG;
       return;
     }
 
@@ -223,7 +220,6 @@ sub addEvent {
         if ( $#row == 0 ) {
             $last_event_id = $row[0];
             if ( $last_event_id >= 0xffff ) {
-                print "  that's to much >0xffff\n" if DEBUG;
 
                 # check step by step if index from 0 on are in use
                 my $num = $dbh->prepare(
@@ -234,10 +230,8 @@ sub addEvent {
                 my $lastused = -1;
                 my $result;
                 while ( $result = $num->fetch() ) {
-                    print "  ${$result}[0] (in use)\n" if DEBUG;
                     if ( ${$result}[0] - $lastused > 1 ) {
                         $last_event_id = $lastused + 1;
-                        print "\n  ${$result}[0] > $lastused\n" if DEBUG;
                         last;
                     }
                     $lastused = ${$result}[0];
@@ -297,7 +291,6 @@ sub listEvent {
     my $dbh = $self->{dbh};
 
     if ( ! defined $uid) {
-      print "Missing uid" if DEBUG;
       return;
     }
 
@@ -379,7 +372,6 @@ sub addEit {
         or !defined $uid
         or !defined $maxsegments
         or !defined $actual) {
-        print "Not enough parameters for adding EIT rule" if DEBUG;
         return;
     };
 
@@ -470,20 +462,16 @@ sub updateEit {
     while ( $rule = $sel->fetchrow_hashref ) {
 
         # first calculate present/following
-        print "update present/following for uid: $rule->{service_id} in pid: $rule->{pid}\n" if DEBUG;
         $ret = $self->updateEitPresent($rule);
         if( ! defined $ret) {
-            print "Error updating present/following tables" if DEBUG;
             return;
         };
         $updated |= $ret;
 
         # and then calculate schedule
         if ( $rule->{maxsegments} > 0 ) {
-            print "update schedule for uid: $rule->{service_id} in pid: $rule->{pid} [" . int( $rule->{maxsegments} / 8 ) . "]\n" if DEBUG;
             $ret = $self->updateEitSchedule($rule);
             if( ! defined $ret) {
-                print "Error updating schedule tables" if DEBUG;
                 return;
             };
             $updated |= $ret;
@@ -533,10 +521,8 @@ sub updateEitPresent {
     if ( !defined $last_version_number ) {
         $last_update_timestamp = 0;
         $last_version_number   = 0;
-        print "  no last_version_number\n" if DEBUG;
     }
 
-    print "  current version_number: $last_version_number\n" if DEBUG;
 
     # always use this time in queries
     my $current_time = time();
@@ -557,35 +543,11 @@ sub updateEitPresent {
 
     my $following_event = $select->fetchrow_hashref;
 
-    if ( DEBUG ) {
-        if ( defined $last_started_event ) {
-            printf( "  last started event_id: %d start: %+d stop: %+d now: %d\n",
-                   $last_started_event->{event_id},
-                   $last_started_event->{start} - $current_time,
-                   $last_started_event->{stop} - $current_time,
-                   $current_time );
-        }
-        else {
-            print("  last started event_id: none\n");
-        }
-        if ( defined $following_event ) {
-            printf( "  following    event_id: %d start: %+d \n",
-                   $following_event->{event_id},
-                   $following_event->{start} - $current_time );
-        }
-        else {
-            print("  following    event_id: none\n");
-        }
-        print("  subtable_timestamp: $last_update_timestamp\n");
-    }
-
     my $buildEit = 0;
 
     # check if we need an update
     # is the last started event still lasting
     if ( defined $last_started_event && $last_started_event->{stop} > $current_time ) {
-        print "  last_started_event: " . $last_started_event->{stop} . "\n" if DEBUG;
-        print "    stop > now\n" if DEBUG;
 
         # was the start already published or is there a change in the event data
         if (
@@ -597,14 +559,12 @@ sub updateEitPresent {
             && $following_event->{timestamp} > $last_update_timestamp
           )       # following event was modified since last update of eit
         {
-            print "    start > last update or event updated\n" if DEBUG;
             $buildEit = 1;
         }
     }
     else {
 
         # last event is over - there is a gap now
-        print "    stop <= now (gap)\n" if DEBUG;
 
         # was the end of the last event published or is there a change in event data of following event
         if ( defined $last_started_event && $last_started_event->{stop} > $last_update_timestamp
@@ -676,15 +636,12 @@ sub updateEitSchedule {
 
     # always use this time in queries
     my $current_time = time();
-    print("  current_time: $current_time\n") if DEBUG;
 
     my $last_midnight = int( $current_time / ( 24 * 60 * 60 ) ) * 24 * 60 * 60;
 
     # iterate over all subtables
     my $subtable_count = 0;
     while ( $subtable_count <= $num_subtable ) {
-
-        print "  subtable_count: $subtable_count/$num_subtable\n" if DEBUG;
 
         # extend the $rule information
         $rule->{table_id} =
@@ -706,8 +663,6 @@ sub updateEitSchedule {
             $last_update_timestamp = 0;
             $last_version_number   = 0;
         }
-
-        print("  current version_number: $last_version_number\n") if DEBUG;
 
         # first segment number in this subtable
         my $first_segment = $subtable_count * 32;
@@ -740,8 +695,6 @@ sub updateEitSchedule {
                 . "AND stop > datetime( $last_update_timestamp,'unixepoch') "
                 . "AND stop < datetime( $current_time,'unixepoch')" );
 
-        print "  first_segment: $first_segment last_segment: $last_segment" if DEBUG;
-
         # skip this subtable if there is no need for updating
         next if $last_update_timestamp >= $last_midnight
                 and $last_event_modification <= $last_update_timestamp
@@ -750,8 +703,6 @@ sub updateEitSchedule {
         # iterate over each segment
         my $segment_count = $first_segment;
         while ( $segment_count < $last_segment ) {
-
-            print "\n    subtable: $subtable_count segment: $segment_count adding: " if DEBUG;
 
             # segment start is in future
             if ( $last_midnight + $segment_count * 3 * 60 * 60 >= $current_time ) {
@@ -770,16 +721,13 @@ sub updateEitSchedule {
                     $ue->{running_status} = 1;
                     $schedule->add2Segment( $segment_count, $ue );    
                     # TODO what if all sections are in use
-                    print "* " if DEBUG;
                 }
             }
 
             # segment stop is in past
-            elsif ( $last_midnight + ( $segment_count + 1 ) * 3 * 60 * 60 - 1 < $current_time )
-            {
+            elsif ( $last_midnight + ( $segment_count + 1 ) * 3 * 60 * 60 - 1 < $current_time ) {
                 # add empty segment
                 $schedule->add2Section( ( $segment_count % 32 ) * 8 );
-                print "empty" if DEBUG;
             }
 
             # segment start is in past but segment end is in future
@@ -798,13 +746,11 @@ sub updateEitSchedule {
                     $ue->{running_status} = $event->{start} < $current_time ? 4 : 1;
                     $schedule->add2Segment( $segment_count, $ue );
                     # TODO what if all sections are in use
-                    print "+" if DEBUG;
                 }
             }
             ++$segment_count;
         }
 
-        print "\n" if DEBUG;
         # Add subtable to playout and update version
         ++$last_version_number;
 
@@ -837,7 +783,7 @@ sub updateEitSchedule {
 
 Build final EIT from all sections in table for given $pid and $timeFrame.
 
-Return the complete elementary stream to be played within the timeframe. 
+Return the complete TS chunk to be played within the timeframe. 
 Return undef on error.
 
 =cut
