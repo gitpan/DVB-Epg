@@ -49,14 +49,16 @@ package DVB::Epg;
 
 use strict;
 use warnings;
+use utf8;
 use DBI qw(:sql_types);
 use Storable qw(freeze thaw);
 use Carp;
 use Exporter;
-use utf8;
+use POSIX qw(ceil);
+
 use vars qw($VERSION @ISA @EXPORT);
 
-our $VERSION = "0.47";
+our $VERSION = "0.50";
 our @ISA     = qw(Exporter);
 our @EXPORT  = qw();
 
@@ -784,6 +786,7 @@ sub updateEitSchedule {
 Build final EIT from all sections in table for given $pid and $timeFrame.
 
 Return the complete TS chunk to be played within the timeframe. 
+Default timeframe should be 60s.
 Return undef on error.
 
 =cut
@@ -802,32 +805,63 @@ sub getEit {
     }
 
     # fetch all sections from database
-    my $sel = $dbh->prepare( "SELECT table_id, service_id, section_number, dump FROM section WHERE pid=$pid ORDER BY table_id" );
+    my $sel = $dbh->prepare( "SELECT table_id, service_id, section_number, dump FROM section WHERE pid=$pid" );
     $sel->execute();
 
     my ( $_table_id, $_service_id, $_section_number, $_dump );
     $sel->bind_columns( \( $_table_id, $_service_id, $_section_number, $_dump ) );
 
-    my @allSections;
-    my $allSectionCount = 0;
-    my $finalMts        = '';
+    my %pfSections = ( present => { packetCount => 0, mts => ''},
+                     following => { packetCount => 0, mts => ''});
+    my $pfFrequency = ceil($timeFrame / 1.7);    # DON'T CHANGE THIS, IT IS THE BASIC CYCLE
+    # the repetition period must be at least 2s by 
+    
+    my @otherSections;
+    my $allPacketCount = 0;
 
     # convert section into MPEG transport stream package and store in hash with
     # some basic information for building up the final MTS
+    # the sections are grouped by present, following and other
     while ( $sel->fetch ) {
         my $section;
         my $mts = _packetize( $pid, $_dump );
-        $section->{mts}  = $mts;
-        $section->{size} = length($mts) / 188;
-        $section->{frequency} = $self->getSectionFrequency( $_table_id, $_section_number, $timeFrame );
-        push( @allSections, $section );
-        $allSectionCount += $section->{frequency} * $section->{size};
+        $section->{mts}            = $mts;
+        $section->{size}           = length($mts) / 188;
+        $section->{frequency}      = $self->getSectionFrequency( $_table_id, $_section_number, $timeFrame );
+        $section->{table_id}       = $_table_id;
+        $section->{service_id}     = $_service_id;
+        $section->{section_number} = $_section_number;
+
+        # p/f table have a higher repetition rate (every 2s) and therefore are grouped separate
+        if( $_table_id == 0x4e) {
+            $section->{frequency} = $pfFrequency;
+            if( $_section_number == 0) {
+                $pfSections{present}{packetCount} += $section->{size};
+                $pfSections{present}{mts} .= $section->{mts};
+            }
+            else {
+                $pfSections{following}{packetCount} += $section->{size};
+                $pfSections{following}{mts} .= $section->{mts};
+            }
+        }
+        else {
+            push( @otherSections, $section);
+        }
+        $allPacketCount += $section->{frequency} * $section->{size};
     }
 
-    # based on the  number of final sections we can calculate the
+    # calculate available space for other sections than present following
+    my $nettoSpace = $allPacketCount - $pfFrequency * ( $pfSections{present}{packetCount} + $pfSections{following}{packetCount});
+    # we are going to put the sections as following
+    # PRESENT other FOLLOWING other PRESENT other FOLLOWING other ....
+    # therefore we have 2 x $pfFrequency gaps to fill up with other sections
+    my $interPfGap = $nettoSpace / (2*$pfFrequency);
+    # it is intentionally decimal number, if there are a small number of sections
+
+    # based on nettoSpace we can calculate the
     # specifical spacing between each repetition of a section
-    foreach my $section (@allSections) {
-        $section->{spacing} = int( $allSectionCount / $section->{frequency} + .5 ) - $section->{size} - 1;
+    foreach my $section ( @otherSections) {
+        $section->{spacing} = int( $nettoSpace / $section->{frequency} + .5 ) - $section->{size} - 1;
 
         # this will be used to call down, when the next repetition should occur
         $section->{nextApply} = 0;
@@ -835,37 +869,73 @@ sub getEit {
         # has the section already been played
         $section->{played} = 0;
     }
+    
+#    printf( " all: %4i netto: %4i gap: %4i rest: %4i\n", $allPacketCount, $nettoSpace, $interPfGap, $nettoSpace-$pfFrequency*$interPfGap);
 
     # let's build the stream
-    while ( $allSectionCount > 0 ) {
+    my $pfCount = 2*$pfFrequency;
+    my $finalMts       = '';
+    my $gapSpace = 0;
+    while ( $pfCount > 0 ) {
 
-        # sort sections by number when it has to apply and frequency
-        @allSections = sort {
-                 $a->{nextApply} <=> $b->{nextApply}
-              || $b->{frequency} <=> $a->{frequency}
-            } @allSections;
-
-        my $j                  = 0;
-        my $numInsertedPackets = $allSections[$j]->{size};
-
-        # add sections to output
-        $finalMts .= $allSections[$j]->{mts};
-
-        --$allSections[$j]->{frequency};
-        $allSections[$j]->{nextApply} = $allSections[$j]->{spacing};
-        $allSections[$j]->{played}    = 1;
-
-        $allSectionCount -= $numInsertedPackets;
-
-        # if all repetitions have been done, remove section from pool
-        if ( $allSections[$j]->{frequency} == 0 ) {
-            shift @allSections;    # remove finished sections
-            $j = -1;
+        # put alternating present and following mts in the stream
+        if( $pfCount % 2 == 0) {
+            $finalMts .= $pfSections{present}{mts};
+            $allPacketCount -= $pfSections{present}{packetCount};
+        }
+        else {
+            $finalMts .= $pfSections{following}{mts};
+            $allPacketCount -= $pfSections{following}{packetCount};
         }
 
-        # correct counters for all sections that have been already played
-        while ( ++$j <= $#allSections ) {
-            $allSections[$j]->{nextApply} -= $numInsertedPackets if $allSections[$j]->{played};
+        $pfCount -= 1;
+
+        # now fill up the gap with other section
+        $gapSpace += $interPfGap;
+
+        # at last iteration we need to put all remaining packets in the stream
+        $gapSpace = $allPacketCount if $pfCount == 0;
+
+        my $sectionCount = 0; 
+
+        while( $gapSpace > 0 && $allPacketCount > 0) {
+            # sort sections by number when it has to apply, frequency and size
+            @otherSections = sort {
+                     $a->{nextApply} <=> $b->{nextApply}
+                  || $b->{frequency} <=> $a->{frequency}
+#                  || int(rand(3))-1
+                } @otherSections;
+            
+            my $j = 0;
+            
+            $sectionCount += 1;
+            my $numInsertedPackets = $otherSections[$j]->{size};
+
+            $gapSpace -= $numInsertedPackets;
+
+            # add sections to output
+            $finalMts .= $otherSections[$j]->{mts};
+
+            $otherSections[$j]->{frequency} -= 1;
+            $otherSections[$j]->{nextApply}  = $otherSections[$j]->{spacing};   #TODO morda bi moral dati tukaj +1 ker dol odštevam
+            $otherSections[$j]->{played}     = 1;
+
+            $allPacketCount -= $numInsertedPackets;
+
+#            printf( " j: %3i size: %2i gapspace: %3i pfcount: %2i all: %3i\n", $j, $otherSections[$j]->{size}, $gapSpace, $pfCount, $allPacketCount);
+
+            # if all repetitions have been done, remove section from pool
+            if ( $otherSections[0]->{frequency} == 0 ) {
+                splice( @otherSections, 0, 1); # remove finished sections
+            }
+
+            $j = 0;
+            # correct counters for all sections that have been already played
+            while ( $j <= $#otherSections ) {
+                $otherSections[$j]->{nextApply} -= $numInsertedPackets if $otherSections[$j]->{played};
+                $j += 1;
+            }
+
         }
     }
 
@@ -873,7 +943,7 @@ sub getEit {
     my $continuity_counter = 0;
     for ( my $j = 3 ; $j < length($finalMts) ; $j += 188 ) {
         substr( $finalMts, $j, 1, chr( 0b00010000 | ( $continuity_counter & 0x0f ) ) );
-        ++$continuity_counter;
+        $continuity_counter += 1;
     }
 
     return $finalMts;
@@ -882,7 +952,7 @@ sub getEit {
 =head3 getSectionFrequency( $table_id, $section_number, $timeFrame)
 
 Make lookup by $table_id and $section_number and return how often this section
-has to be repeated in the given interval. Default $timeFrame is 30 seconds.
+has to be repeated in the given interval. Default interval ($timeFrame) is 60 seconds.
 
 =cut
 
@@ -891,21 +961,20 @@ sub getSectionFrequency {
     my $table_id       = shift;
     my $section_number = shift;
     my $timeFrame      = shift;
-    $timeFrame = 30 if !defined $timeFrame;
+    $timeFrame = 60 if !defined $timeFrame;
 
   # according to some scandinavian and australian specification we use following
   # repetition rate:
-  # EITp/f actual 2s per program
-  # EITp/f other 2s per program
-  # EITsched actual 1 day 10s per program
-  # EITsched actual other days 30s per program
-  # EITsched other 1 day 10s per program
-  # EITsched other other days 30s per program
-    return $timeFrame / 2 if $table_id == 0x4e or $table_id == 0x4f;
-
-    return $timeFrame / 10 if ( $table_id == 0x50 or $table_id == 0x60 ) and ( $section_number < (8 * 24 / 3 ));
-
-    return $timeFrame / 30;
+  # EITp/f actual              - every <2s
+  # EITp/f other               - every <10s
+  # EITsched actual 1 day      - every 10s
+  # EITsched actual other days - every 30s
+  # EITsched other 1 day       - every 30s
+  # EITsched other other days  - every 30s
+  # THE FREQUENCY FOR PRESENT/FOLLOWING TABLE 0X4E IS DEFINED IN THE CALLING SUBROUTINE
+    return ceil($timeFrame / 8) if $table_id == 0x4f;
+    return ceil($timeFrame / 10) if ( $table_id == 0x50) and ( $section_number < (1 * 24 / 3 )); # days * 24 / 3
+    return ceil($timeFrame / 30);
 }
 
 =head3 getLastError( )
@@ -1083,7 +1152,7 @@ Add $event to section with number $section_number.
 $event is reference to hash containin event data.
 
 Return binary $size of all events in section (always < 4078) 
-or undef if section is full or error.
+or negativ if section is full, undef on error.
 
 =cut
 
@@ -1201,11 +1270,11 @@ sub _getDescriptorBin {
         # short_event_descriptor
         my $descriptor_tag = 0x4d;
         my $descriptor_length;
-        my $language_code   = $descriptor->{language_code}   || 'slv';
-        my $codepage_prefix = $descriptor->{codepage_prefix} || '';
+        my $language_code   = _getByteString( $descriptor->{language_code} || 'slv');
+        my $codepage_prefix = _getByteString( $descriptor->{codepage_prefix});
         my $raw_event_name  = $descriptor->{event_name}      || '';
         my $raw_text        = $descriptor->{text}            || '';
-
+        
         my $codepage_prefix_length = length( $codepage_prefix );
 
         my $event_name = "";
@@ -1234,7 +1303,7 @@ sub _getDescriptorBin {
 
         my $substruct = '';
         foreach ( @{ $descriptor->{list} } ) {
-            my $country_code = $_->{country_code} || 'slv';
+            my $country_code = _getByteString( $_->{country_code} || 'SVN');
             my $rating       = $_->{rating}       || 0;
             $substruct .= pack( "a3C", $country_code, $rating );
         }
@@ -1299,8 +1368,8 @@ sub _getExtendedEventDescriptorBin {
     my $last_descriptor_number = int( $full_text_length / $maxTextLength );
 
     my $descriptor_tag         = 0x4e;
-    my $language_code          = $descriptor->{language_code} || 'slv';
-    my $codepage_prefix        = $descriptor->{codepage_prefix} || '';
+    my $language_code          = _getByteString( $descriptor->{language_code} || 'slv');
+    my $codepage_prefix        = _getByteString( $descriptor->{codepage_prefix});
     my $codepage_prefix_length = length($codepage_prefix);
     my $descriptor_length;
     my $length_of_items = 0;
