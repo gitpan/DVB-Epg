@@ -47,6 +47,7 @@ package DVB::EventInformationTable;
 
 package DVB::Epg;
 
+use 5.010;
 use strict;
 use warnings;
 use utf8;
@@ -58,7 +59,7 @@ use POSIX qw(ceil);
 
 use vars qw($VERSION @ISA @EXPORT);
 
-our $VERSION = "0.50";
+our $VERSION = "0.51";
 our @ISA     = qw(Exporter);
 our @EXPORT  = qw();
 
@@ -209,7 +210,7 @@ sub addEvent {
     $event->{free_CA_mode} = exists $event->{free_CA_mode} ? $event->{free_CA_mode} & 1 : 0;
 
     # in case when no event_id is defined
-    if ( !exists $event->{id} ) {
+    if ( !defined $event->{id}) {
 
         # find highest event_id currently used
         my @row = $dbh->selectrow_array( "SELECT event_id FROM event WHERE "
@@ -500,7 +501,7 @@ Return 1 after updating sections.
 sub updateEitPresent {
     my $self = shift;
     my $rule = shift;
-    my $forced = shift || 0;
+    my $forced = shift // 0;
     my $dbh  = $self->{dbh};
 
     # extend the $rule information
@@ -917,7 +918,7 @@ sub getEit {
             $finalMts .= $otherSections[$j]->{mts};
 
             $otherSections[$j]->{frequency} -= 1;
-            $otherSections[$j]->{nextApply}  = $otherSections[$j]->{spacing};   #TODO morda bi moral dati tukaj +1 ker dol odštevam
+            $otherSections[$j]->{nextApply}  = $otherSections[$j]->{spacing};  
             $otherSections[$j]->{played}     = 1;
 
             $allPacketCount -= $numInsertedPackets;
@@ -1163,7 +1164,7 @@ sub add2Section {
 
     return if !defined $section_number;
 
-    my $section_size = length( $self->{sections}[$section_number] || "" );
+    my $section_size = length( $self->{sections}[$section_number] // "" );
 
     # add empty event
     if ( !defined $event ) {
@@ -1210,7 +1211,7 @@ Return reference to hash of sections with section_number as key and section as v
 
 sub getSections {
     my $self           = shift;
-    my $version_number = shift || 0;
+    my $version_number = shift // 0;
     my $sections       = {};
 
     my $last_section_number = $#{ $self->{sections} };
@@ -1270,10 +1271,10 @@ sub _getDescriptorBin {
         # short_event_descriptor
         my $descriptor_tag = 0x4d;
         my $descriptor_length;
-        my $language_code   = _getByteString( $descriptor->{language_code} || 'slv');
+        my $language_code   = _getByteString( $descriptor->{language_code} // 'slv');
         my $codepage_prefix = _getByteString( $descriptor->{codepage_prefix});
-        my $raw_event_name  = $descriptor->{event_name}      || '';
-        my $raw_text        = $descriptor->{text}            || '';
+        my $raw_event_name  = $descriptor->{event_name} // '';
+        my $raw_text        = $descriptor->{text} // '';
         
         my $codepage_prefix_length = length( $codepage_prefix );
 
@@ -1303,8 +1304,8 @@ sub _getDescriptorBin {
 
         my $substruct = '';
         foreach ( @{ $descriptor->{list} } ) {
-            my $country_code = _getByteString( $_->{country_code} || 'SVN');
-            my $rating       = $_->{rating}       || 0;
+            my $country_code = _getByteString( $_->{country_code} // 'SVN');
+            my $rating       = $_->{rating} // 0;
             $substruct .= pack( "a3C", $country_code, $rating );
         }
         $descriptor_length = length($substruct);
@@ -1334,7 +1335,7 @@ Return converted string.
 
 sub _getByteString {
     my $string = shift;
-    return "" if !defined $string || $string eq "";
+    return "" if ! $string;
     return pack( "C*", unpack( "U*", $string ) );
 }
 
@@ -1368,7 +1369,7 @@ sub _getExtendedEventDescriptorBin {
     my $last_descriptor_number = int( $full_text_length / $maxTextLength );
 
     my $descriptor_tag         = 0x4e;
-    my $language_code          = _getByteString( $descriptor->{language_code} || 'slv');
+    my $language_code          = _getByteString( $descriptor->{language_code} // 'slv');
     my $codepage_prefix        = _getByteString( $descriptor->{codepage_prefix});
     my $codepage_prefix_length = length($codepage_prefix);
     my $descriptor_length;
@@ -1437,9 +1438,6 @@ sub _epoch2mjd {
     my ( $sec, $min, $hour, $mday, $mon, $year, $wday, $yday ) = gmtime($time);
     ++$mon;
 
-#  old implementation
-#  my $L = $mon==1 || $mon==2 ? -1 : 0;
-#  my $MJD = ceil( $mday + 15047.5 + 65.2425 * ($year+$L) + (0.58333 *($mon-2-$L*12)));
     my $l = $mon == 1 || $mon == 2 ? 1 : 0;
     my $MJD = 14956 + $mday + int( ( $year - $l ) * 365.25 ) + int( ( $mon + 1 + $l * 12 ) * 30.6001 );
     my $struct = pack( 'na*', $MJD, _int2bcd( $time % ( 60 * 60 * 24 ) ) );

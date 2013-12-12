@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               DVB-Epg
-version:            0.50
+version:            0.51
 abstract:           Generate MPEG-2 transport stream chunk containing DVB Event Information table.
 author:
     - Bojan Ramšak <BojanR@gmx.net>

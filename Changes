@@ -25,3 +25,7 @@ Revision history for DVB-Epg
 0.50   2013-02-21 22:58 CET
         - Complete redesign of building output chunk. Now conform with 
           Bridgetech and Dektec monitoring probe
+          
+0.51   2013-12-12 22:29 CET
+        - Code cleanup || -> //
+        - fix problem when inserting event with undefined event_id
